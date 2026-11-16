@@ -1,0 +1,156 @@
+"""
+Built-in sample workspaces: every sample question passes the app's own quality gates, and a user
+gets three ready workspaces whose quiz, mastery tracking, flashcards and study plan all work without
+an AI provider.
+"""
+import pytest
+
+from backend.app.repositories.secondary import flashcard_repo
+from backend.app.sample_content import cn, dbms, os as os_notes
+from backend.app.services import question_bank as qb
+from backend.app.services.question_quality_validator import validate_mcq_production_gate
+
+MODULES = [os_notes, dbms, cn]
+
+
+@pytest.mark.parametrize("module", MODULES, ids=lambda m: m.WORKSPACE["name"])
+def test_every_sample_question_passes_the_quality_gates(module):
+    for c in module.CONCEPTS:
+        assert len(c["questions"]) >= 4 and len(c["cards"]) >= 3
+        assert {q[0] for q in c["questions"]} >= {1, 2, 3}
+        concept = {"topic": c["topic"], "concept": c["concept"], "source_pages": [c["page"]]}
+        for difficulty, text, options, answer, explanation in c["questions"]:
+            q = qb.build_question(
+                {"question_text": text, "options": options, "correct_option": answer,
+                 "explanation": explanation, "difficulty": difficulty},
+                concept, source_excerpt=c["summary"],
+            )
+            assert q is not None, text
+            # The shuffled key still points at the intended answer
+            right = options["ABCD".index(answer)]
+            assert next(o["text"] for o in q.options if o["key"] == q.correct_option) == right
+            gate = validate_mcq_production_gate(
+                question_text=q.question_text, options=q.options, correct_option=q.correct_option,
+                concept=q.concept, topic=q.topic,
+            )
+            assert gate.is_valid, (text, getattr(gate, "reasons", None) or gate)
+
+
+@pytest.mark.asyncio
+async def test_sample_workspaces_work_end_to_end(async_client):
+    from backend.app.repositories.workspaces import workspace_repo
+
+    for w in await workspace_repo.list_by_owner("usr_test_default"):  # start clean
+        if w.get("is_sample"):
+            await workspace_repo.delete(w["id"])
+    res = await async_client.post("/api/v1/sample-workspaces")
+    assert res.status_code == 201, res.text
+    created = res.json()["workspaces"]
+    # The notes are indexed in the background after the response; let that finish here
+    import asyncio
+    from backend.app.api.routes.documents import _INGEST_TASKS
+
+    if _INGEST_TASKS:
+        await asyncio.gather(*list(_INGEST_TASKS))
+    by_name = {w["name"]: w for w in created}
+    assert set(by_name) == {"Operating Systems", "DBMS", "Computer Networks"}
+    ws = (await async_client.get(f"/api/v1/workspaces/{by_name['Operating Systems']['id']}")).json()
+    assert ws["is_sample"] is True and ws["document_count"] == 1
+    assert "sample" not in (ws["description"] or "").lower()
+
+    # A second call adds nothing
+    again = await async_client.post("/api/v1/sample-workspaces")
+    assert again.status_code == 201 and again.json()["total_count"] == 0
+
+    ws_id = ws["id"]
+    # Flashcards are ready
+    cards = await flashcard_repo.list_by_workspace(ws_id)
+    assert len(cards) == 21 and all(c["generator"] == qb.GENERATOR_TAG for c in cards)
+
+    # The study plan is topic-wise from the sample topic map
+    plan = (await async_client.get(f"/api/v1/workspaces/{ws_id}/study-plan")).json()
+    assert plan["coverage"]["total_concepts"] == 7
+    learn = [t["title"] for t in plan["tasks"] if t["kind"] == "learn"]
+    assert learn[0] == "Learn: Process and Process States"
+    assert any(t["kind"] == "flashcards" for t in plan["tasks"] if t["scheduledFor"] == "today")
+
+    # A quiz starts straight away and scores answers
+    quiz = await async_client.post(f"/api/v1/workspaces/{ws_id}/quizzes", json={"target_question_count": 5})
+    assert quiz.status_code == 201, quiz.text
+    session = quiz.json()
+    q = session["current_question"]
+    assert q and len(q["options"]) == 4
+    for _ in range(session["target_question_count"]):
+        r = await async_client.post(
+            f"/api/v1/workspaces/{ws_id}/quizzes/{session['id']}/questions/{q['id']}/attempt",
+            json={"selected_option": "A", "response_time_ms": 4000},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if body["is_quiz_completed"]:
+            break
+        q = body.get("next_question") or (await async_client.get(
+            f"/api/v1/workspaces/{ws_id}/quizzes/{session['id']}")).json()["current_question"]
+    summary = await async_client.post(f"/api/v1/workspaces/{ws_id}/quizzes/{session['id']}/complete")
+    assert summary.status_code == 200, summary.text
+
+    # Mastery was recorded, so the plan now has quiz evidence
+    after = (await async_client.get(f"/api/v1/workspaces/{ws_id}/study-plan")).json()
+    assert after["coverage"]["not_started"] < 7
+
+
+@pytest.mark.asyncio
+async def test_sample_notes_are_indexed_even_when_embeddings_are_unavailable(monkeypatch):
+    from backend.app.repositories.workspaces import workspace_repo
+    from backend.app.services import sample_workspaces
+    from backend.app.services.embeddings import EmbeddingUnavailableError, embedding_service
+
+    async def unavailable(texts):
+        raise EmbeddingUnavailableError("rate-limited")
+
+    monkeypatch.setattr(embedding_service, "embed_documents", unavailable)
+    owner = "usr_test_default"  # the signed-in test user (exists in the database too)
+    for w in await workspace_repo.list_by_owner(owner):
+        if w.get("is_sample"):
+            await workspace_repo.delete(w["id"])
+    created = await sample_workspaces.create_for_user(owner, wait_for_indexing=True)
+    assert len(created) == 3
+    from backend.app.repositories.documents import document_repo
+
+    for ws in created:
+        docs = await document_repo.list_by_workspace(ws["id"])
+        assert [d["status"] for d in docs] == ["ready"]
+    listing = await workspace_repo.list_by_owner(owner)
+    assert sum(1 for w in listing if w.get("is_sample")) == 3
+
+
+@pytest.mark.asyncio
+async def test_every_account_gets_the_starter_workspaces_once(async_client, monkeypatch):
+    import asyncio
+
+    from backend.app.api.routes.documents import _INGEST_TASKS
+    from backend.app.core.config import settings
+    from backend.app.repositories.users import user_repo
+    from backend.app.repositories.workspaces import workspace_repo
+
+    owner = "usr_test_default"
+    for w in await workspace_repo.list_by_owner(owner):
+        if w.get("is_sample"):
+            await workspace_repo.delete(w["id"])
+    await user_repo._update(owner, {"starter_workspaces_added": False})
+    monkeypatch.setattr(settings, "starter_workspaces", True)
+
+    first, second = await asyncio.gather(
+        async_client.get("/api/v1/workspaces"), async_client.get("/api/v1/workspaces")
+    )
+    if _INGEST_TASKS:
+        await asyncio.gather(*list(_INGEST_TASKS))
+    listing = (await async_client.get("/api/v1/workspaces")).json()["workspaces"]
+    names = sorted(w["name"] for w in listing if w.get("is_sample"))
+    assert names == ["Computer Networks", "DBMS", "Operating Systems"]
+
+    # Deleting one doesn't bring it back on the next visit
+    os_ws = next(w for w in listing if w["name"] == "Operating Systems" and w.get("is_sample"))
+    await async_client.delete(f"/api/v1/workspaces/{os_ws['id']}")
+    listing = (await async_client.get("/api/v1/workspaces")).json()["workspaces"]
+    assert sorted(w["name"] for w in listing if w.get("is_sample")) == ["Computer Networks", "DBMS"]

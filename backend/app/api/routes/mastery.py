@@ -1,0 +1,375 @@
+"""
+LumoraAI - Topic Mastery and Learner Profile API Routes
+Authoritative endpoints for workspace-scoped topic mastery, concept hierarchies,
+and the Learner Knowledge Profile.
+"""
+from typing import Optional, List, Dict, Any
+from backend.app.core.config import settings
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from backend.app.api.deps import require_workspace
+from pydantic import BaseModel
+
+from backend.app.core.logging import get_logger
+from backend.app.repositories.workspaces import workspace_repo
+from backend.app.repositories.bkt import bkt_repo
+from backend.app.repositories.topic_mastery import topic_mastery_repo
+from backend.app.services.topic_mastery_engine import (
+    topic_mastery_engine,
+    normalize_topic_name,
+)
+from backend.app.services.learner_profile_service import learner_profile_service
+from backend.app.schemas.mastery import (
+    ConceptMasteryDetail,
+    TopicMasteryDetail,
+    TopicMasteryListResponse,
+    LearnerProfileResponse,
+    WorkspaceMasteryOverviewResponse,
+    OverallMasterySummary,
+)
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/workspaces/{workspace_id}", tags=["Topic Mastery & Profile"], dependencies=[Depends(require_workspace)])
+
+
+def learner_id() -> str:
+    """
+    Learner-model rows are keyed by workspace; each workspace has exactly one owner, so the
+    internal learner id is fixed. It is no longer accepted from the client.
+    """
+    return "default_user"
+
+
+@router.get(
+    "/learner-profile",
+    response_model=LearnerProfileResponse,
+    summary="Get Workspace Learner Knowledge Profile",
+)
+async def get_workspace_learner_profile(
+    workspace_id: str,
+    user_id: str = Depends(learner_id),
+) -> LearnerProfileResponse:
+    ws = await workspace_repo.get_by_id(workspace_id)
+    if not ws:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{workspace_id}' not found.",
+        )
+
+    profile_data = await learner_profile_service.get_learner_profile(workspace_id, user_id)
+    return LearnerProfileResponse(**profile_data)
+
+
+@router.get(
+    "/mastery",
+    response_model=WorkspaceMasteryOverviewResponse,
+    summary="Get Workspace Mastery Overview",
+)
+async def get_workspace_mastery_overview(
+    workspace_id: str,
+    user_id: str = Depends(learner_id),
+) -> WorkspaceMasteryOverviewResponse:
+    ws = await workspace_repo.get_by_id(workspace_id)
+    if not ws:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{workspace_id}' not found.",
+        )
+
+    profile_data = await learner_profile_service.get_learner_profile(workspace_id, user_id)
+    raw_topics = await topic_mastery_repo.list_topic_mastery(workspace_id, user_id)
+    raw_concepts = await bkt_repo.list_concept_mastery(workspace_id, user_id)
+    raw_gaps = await bkt_repo.list_knowledge_gaps(workspace_id, user_id)
+
+    topics_res = [
+        TopicMasteryDetail(
+            topic=t.get("topic"),
+            workspace_id=workspace_id,
+            mastery_probability=t.get("mastery_probability", 0.30),
+            mastery_percentage=int(round(t.get("mastery_probability", 0.30) * 100)),
+            confidence_level=t.get("confidence_level", "low"),
+            mastery_status=t.get("mastery_status", "developing"),
+            trend=t.get("trend", "insufficient_data"),
+            concept_count=t.get("concept_count", 0),
+            assessed_concept_count=t.get("assessed_concept_count", 0),
+            coverage_ratio=t.get("coverage_ratio", 0.0),
+            attempt_count=t.get("attempt_count", 0),
+            correct_count=t.get("correct_count", 0),
+            recent_accuracy=t.get("recent_accuracy", 0.0),
+            average_response_time_ms=t.get("average_response_time_ms", 0),
+            gap_priority=t.get("gap_priority", 0.0),
+            last_assessed_at=t.get("last_assessed_at"),
+        )
+        for t in raw_topics
+    ]
+
+    concepts_res = [
+        ConceptMasteryDetail(
+            concept=c.get("concept"),
+            topic=c.get("topic"),
+            p_mastery=c.get("p_mastery", 0.30),
+            mastery_percentage=int(round(c.get("p_mastery", 0.30) * 100)),
+            confidence_level=c.get("confidence_level", "low"),
+            mastery_status=c.get("mastery_status", "developing"),
+            trend=c.get("trend", "insufficient_data"),
+            attempts_count=c.get("attempts_count", 0),
+            correct_count=c.get("correct_count", 0),
+            recent_accuracy=c.get("recent_accuracy", 0.0),
+            average_response_time_ms=c.get("average_response_time_ms", 0),
+            last_practiced_at=c.get("last_practiced_at"),
+        )
+        for c in raw_concepts
+    ]
+
+    return WorkspaceMasteryOverviewResponse(
+        workspace_id=workspace_id,
+        overall=OverallMasterySummary(**profile_data["overall"]),
+        topics=topics_res,
+        concepts=concepts_res,
+        knowledge_gaps=raw_gaps,
+    )
+
+
+@router.get(
+    "/mastery/topics",
+    response_model=TopicMasteryListResponse,
+    summary="List Workspace Topics Mastery",
+)
+async def list_workspace_topics(
+    workspace_id: str,
+    user_id: str = Depends(learner_id),
+) -> TopicMasteryListResponse:
+    ws = await workspace_repo.get_by_id(workspace_id)
+    if not ws:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{workspace_id}' not found.",
+        )
+
+    raw_topics = await topic_mastery_repo.list_topic_mastery(workspace_id, user_id)
+    if not raw_topics:
+        raw_topics = await topic_mastery_engine.recalculate_all_workspace_topics(workspace_id, user_id)
+
+    all_concepts = await bkt_repo.list_concept_mastery(workspace_id, user_id)
+    concepts_by_topic: Dict[str, List[ConceptMasteryDetail]] = {}
+    for c in all_concepts:
+        nt = normalize_topic_name(c.get("topic", "General"))
+        if nt not in concepts_by_topic:
+            concepts_by_topic[nt] = []
+        concepts_by_topic[nt].append(
+            ConceptMasteryDetail(
+                concept=c.get("concept"),
+                topic=c.get("topic"),
+                p_mastery=c.get("p_mastery", 0.30),
+                mastery_percentage=int(round(c.get("p_mastery", 0.30) * 100)),
+                confidence_level=c.get("confidence_level", "low"),
+                mastery_status=c.get("mastery_status", "developing"),
+                trend=c.get("trend", "insufficient_data"),
+                attempts_count=c.get("attempts_count", 0),
+                correct_count=c.get("correct_count", 0),
+                recent_accuracy=c.get("recent_accuracy", 0.0),
+                average_response_time_ms=c.get("average_response_time_ms", 0),
+                last_practiced_at=c.get("last_practiced_at"),
+            )
+        )
+
+    topics_res = [
+        TopicMasteryDetail(
+            topic=t.get("topic"),
+            workspace_id=workspace_id,
+            mastery_probability=t.get("mastery_probability", 0.30),
+            mastery_percentage=int(round(t.get("mastery_probability", 0.30) * 100)),
+            confidence_level=t.get("confidence_level", "low"),
+            mastery_status=t.get("mastery_status", "developing"),
+            trend=t.get("trend", "insufficient_data"),
+            concept_count=max(t.get("concept_count", 0), len(concepts_by_topic.get(normalize_topic_name(t.get("topic", "")), []))),
+            assessed_concept_count=len(concepts_by_topic.get(normalize_topic_name(t.get("topic", "")), [])),
+            coverage_ratio=t.get("coverage_ratio", 0.0),
+            attempt_count=t.get("attempt_count", 0),
+            correct_count=t.get("correct_count", 0),
+            recent_accuracy=t.get("recent_accuracy", 0.0),
+            average_response_time_ms=t.get("average_response_time_ms", 0),
+            gap_priority=t.get("gap_priority", 0.0),
+            concepts=concepts_by_topic.get(normalize_topic_name(t.get("topic", "")), []),
+            last_assessed_at=t.get("last_assessed_at"),
+        )
+        for t in raw_topics
+    ]
+
+    return TopicMasteryListResponse(
+        workspace_id=workspace_id,
+        topics=topics_res,
+        total_count=len(topics_res),
+    )
+
+
+@router.get(
+    "/mastery/topics/{topic}",
+    response_model=TopicMasteryDetail,
+    summary="Get Topic Mastery Detail with Underlying Concepts",
+)
+async def get_topic_detail(
+    workspace_id: str,
+    topic: str,
+    user_id: str = Depends(learner_id),
+) -> TopicMasteryDetail:
+    ws = await workspace_repo.get_by_id(workspace_id)
+    if not ws:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{workspace_id}' not found.",
+        )
+
+    norm_topic = normalize_topic_name(topic)
+    topic_record = await topic_mastery_engine.ensure_topic_mastery_current(workspace_id, norm_topic, user_id=user_id)
+
+    all_concepts = await bkt_repo.list_concept_mastery(workspace_id, user_id)
+    matching_concepts = [
+        ConceptMasteryDetail(
+            concept=c.get("concept"),
+            topic=c.get("topic"),
+            p_mastery=c.get("p_mastery", 0.30),
+            mastery_percentage=int(round(c.get("p_mastery", 0.30) * 100)),
+            confidence_level=c.get("confidence_level", "low"),
+            mastery_status=c.get("mastery_status", "developing"),
+            trend=c.get("trend", "insufficient_data"),
+            attempts_count=c.get("attempts_count", 0),
+            correct_count=c.get("correct_count", 0),
+            recent_accuracy=c.get("recent_accuracy", 0.0),
+            average_response_time_ms=c.get("average_response_time_ms", 0),
+            last_practiced_at=c.get("last_practiced_at"),
+        )
+        for c in all_concepts
+        if normalize_topic_name(c.get("topic", "")) == norm_topic
+    ]
+
+    return TopicMasteryDetail(
+        topic=norm_topic,
+        workspace_id=workspace_id,
+        mastery_probability=topic_record.get("mastery_probability", 0.30),
+        mastery_percentage=int(round(topic_record.get("mastery_probability", 0.30) * 100)),
+        confidence_level=topic_record.get("confidence_level", "low"),
+        mastery_status=topic_record.get("mastery_status", "developing"),
+        trend=topic_record.get("trend", "insufficient_data"),
+        concept_count=max(topic_record.get("concept_count", len(matching_concepts)), len(matching_concepts), 1),
+        assessed_concept_count=len(matching_concepts),
+        coverage_ratio=topic_record.get("coverage_ratio", 0.0),
+        attempt_count=topic_record.get("attempt_count", 0),
+        correct_count=topic_record.get("correct_count", 0),
+        recent_accuracy=topic_record.get("recent_accuracy", 0.0),
+        average_response_time_ms=topic_record.get("average_response_time_ms", 0),
+        gap_priority=topic_record.get("gap_priority", 0.0),
+        concepts=matching_concepts,
+        last_assessed_at=topic_record.get("last_assessed_at"),
+    )
+
+
+class ConceptSeedItem(BaseModel):
+    concept: str
+    topic: str
+    p_mastery: float
+    is_correct: bool = True
+    attempts: int = 5
+    correct: int = 4
+    gap_priority: Optional[float] = None
+    status: Optional[str] = None
+    action: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class MasterySeedRequest(BaseModel):
+    user_ids: List[str] = ["default_user", "presentation-demo-user"]
+    concepts: List[ConceptSeedItem]
+
+
+@router.post(
+    "/mastery/seed",
+    status_code=status.HTTP_200_OK,
+    summary="Seed Concept Mastery and Knowledge Gaps",
+)
+async def seed_workspace_mastery(
+    workspace_id: str,
+    request: MasterySeedRequest,
+):
+    # Development/test utility: writing mastery directly bypasses BKT, so it is disabled in production.
+    if settings.environment.lower() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Mastery seeding is only available outside production.",
+        )
+    ws = await workspace_repo.get_by_id(workspace_id)
+    if not ws:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{workspace_id}' not found.",
+        )
+    for u_id in request.user_ids:
+        for item in request.concepts:
+            await bkt_repo.upsert_concept_mastery(
+                workspace_id=workspace_id,
+                topic=item.topic,
+                concept=item.concept,
+                p_mastery=item.p_mastery,
+                is_correct=item.is_correct,
+                response_time_ms=1800,
+                user_id=u_id,
+            )
+            if item.gap_priority is not None:
+                await bkt_repo.upsert_knowledge_gap(
+                    workspace_id=workspace_id,
+                    topic=item.topic,
+                    concept=item.concept,
+                    gap_priority=item.gap_priority,
+                    gap_status=item.status or "critical_gap",
+                    contributing_signals={"low_accuracy": True, "bkt_probability": item.p_mastery},
+                    recommended_action=item.action or "targeted_practice",
+                    user_id=u_id,
+                )
+        await topic_mastery_engine.recalculate_all_workspace_topics(workspace_id, user_id=u_id)
+        await learner_profile_service.get_learner_profile(workspace_id, user_id=u_id)
+
+    return {"status": "ok", "workspace_id": workspace_id, "seeded_concepts": len(request.concepts)}
+
+
+
+@router.get(
+    "/mastery/history",
+    summary="Workspace mastery over time",
+)
+async def get_mastery_history(
+    workspace_id: str,
+    days: int = Query(default=30, ge=1, le=365),
+    user_id: str = Depends(learner_id),
+):
+    """
+    Daily workspace mastery for the last `days` days, computed from the topic snapshots stored
+    after every answer: each day's value is the mean of every topic's latest mastery so far.
+    Days without new evidence carry the previous value forward.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    start_day = (now - timedelta(days=days - 1)).date()
+    snaps = await topic_mastery_repo.list_snapshots_since(
+        workspace_id, datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc), user_id=user_id
+    )
+
+    latest_by_topic: Dict[str, float] = {}
+    by_day: Dict[str, float] = {}
+    for snap in snaps:
+        created = snap["created_at"]
+        if isinstance(created, str):
+            created = datetime.fromisoformat(created)
+        latest_by_topic[snap["entity_id"]] = float(snap["mastery_probability"])
+        by_day[created.date().isoformat()] = sum(latest_by_topic.values()) / len(latest_by_topic)
+
+    points = []
+    last_value = None
+    for i in range(days):
+        day = (start_day + timedelta(days=i)).isoformat()
+        if day in by_day:
+            last_value = by_day[day]
+        if last_value is not None:
+            points.append({"date": day, "mastery_percentage": round(last_value * 100, 1)})
+
+    return {"workspace_id": workspace_id, "days": days, "points": points}

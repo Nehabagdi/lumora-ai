@@ -1,0 +1,235 @@
+import os
+from pathlib import Path
+from typing import List, Optional
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+
+# Resolve absolute paths to repository root and backend directory .env files
+_CONFIG_DIR = Path(__file__).resolve().parent
+_BACKEND_DIR = _CONFIG_DIR.parent.parent
+_ROOT_DIR = _BACKEND_DIR.parent
+
+_ROOT_ENV = _ROOT_DIR / ".env"
+_BACKEND_ENV = _BACKEND_DIR / ".env"
+
+# Explicitly load .env files
+if _ROOT_ENV.exists():
+    load_dotenv(_ROOT_ENV)
+if _BACKEND_ENV.exists():
+    load_dotenv(_BACKEND_ENV)
+
+
+# Gemini models that may generate study material (GEMINI_GENERATION_MODEL)
+GENERATION_MODELS = {"gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-4-argon"}
+
+class Settings(BaseSettings):
+    # Server & Environment
+    app_name: str = "LumoraAI Backend"
+    environment: str = Field(default="development", validation_alias="ENVIRONMENT")
+    presentation_mode: bool = Field(default=False, validation_alias="PRESENTATION_MODE")
+    port: int = Field(default=8000, validation_alias="PORT")
+    frontend_origin: str = Field(default="http://localhost:3000", validation_alias="FRONTEND_ORIGIN")
+    allowed_origins: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    # Google Gemini AI Configuration (Single authoritative source of truth: models/gemini-3.8-flash)
+    gemini_api_key: Optional[str] = Field(default=None, validation_alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="models/gemini-3.8-flash", validation_alias="GEMINI_MODEL")
+    gemini_embedding_model: str = Field(
+        default="models/gemini-embedding-001", validation_alias="GEMINI_EMBEDDING_MODEL"
+    )
+    embedding_dimensions: int = Field(default=768, validation_alias="EMBEDDING_DIMENSIONS")
+    # Model used to build study material (topic maps, quiz questions, flashcards). Gemini 3.8 Flash
+    # is the default; a stronger model can be chosen when the API key's plan includes it.
+    gemini_generation_model: str = Field(
+        default="gemini-3.8-flash", validation_alias="GEMINI_GENERATION_MODEL"
+    )
+    # A second AI pass reviews every generated quiz question and rejects weak ones
+    study_material_review: bool = Field(default=True, validation_alias="STUDY_MATERIAL_REVIEW")
+
+    # Secondary AI Provider Configuration (OpenRouter / OpenAI-compatible)
+    secondary_ai_provider_name: str = Field(default="openrouter", validation_alias="SECONDARY_AI_PROVIDER_NAME")
+    openrouter_api_key: Optional[str] = Field(default=None, validation_alias="OPENROUTER_API_KEY")
+    secondary_ai_api_key: Optional[str] = Field(default=None, validation_alias="SECONDARY_AI_API_KEY")
+    secondary_ai_base_url: str = Field(default="https://openrouter.ai/api/v1", validation_alias="SECONDARY_AI_BASE_URL")
+    secondary_ai_model: str = Field(default="qwen/qwen3.8-27b:free", validation_alias="SECONDARY_AI_MODEL")
+    # Longest answer the secondary model may write. Always sent: providers such as Groq otherwise
+    # count the model's full maximum against the per-minute token limit and reject every request.
+    secondary_ai_max_tokens: int = Field(default=4096, ge=256, le=32768, validation_alias="SECONDARY_AI_MAX_TOKENS")
+    secondary_ai_timeout_seconds: float = Field(default=90.0, ge=10, le=300, validation_alias="SECONDARY_AI_TIMEOUT_SECONDS")
+    openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
+    openai_base_url: Optional[str] = Field(default=None, validation_alias="OPENAI_BASE_URL")
+    openai_model: Optional[str] = Field(default=None, validation_alias="OPENAI_MODEL")
+
+    @property
+    def effective_secondary_api_key(self) -> Optional[str]:
+        return self.openrouter_api_key or self.secondary_ai_api_key or self.openai_api_key
+
+    @property
+    def effective_secondary_base_url(self) -> str:
+        return self.secondary_ai_base_url or self.openai_base_url or "https://openrouter.ai/api/v1"
+
+    @property
+    def effective_secondary_model(self) -> str:
+        return self.secondary_ai_model or self.openai_model or "qwen/qwen3.8-27b:free"
+
+    # Supabase & PostgreSQL Credentials
+    supabase_url: Optional[str] = Field(default=None, validation_alias="SUPABASE_URL")
+    supabase_service_role_key: Optional[str] = Field(
+        default=None, validation_alias="SUPABASE_SERVICE_ROLE_KEY"
+    )
+    supabase_anon_key: Optional[str] = Field(default=None, validation_alias="SUPABASE_ANON_KEY")
+    database_url: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
+    supabase_storage_bucket: str = Field(
+        default="workspace-documents", validation_alias="SUPABASE_STORAGE_BUCKET"
+    )
+
+    # RAG Retrieval Quality & Thresholds
+    rag_top_k: int = Field(default=5, validation_alias="RAG_TOP_K")
+    # Note: the grounding threshold actually applied (tau = 0.50) is set in RetrievalService
+    # (services/retrieval.py); this setting is kept for compatibility but is not read there.
+    rag_similarity_threshold: float = Field(default=0.65, validation_alias="RAG_SIMILARITY_THRESHOLD")
+    max_context_tokens: int = Field(default=3500, validation_alias="MAX_CONTEXT_TOKENS")
+    conversation_history_limit: int = Field(
+        default=8, validation_alias="CONVERSATION_HISTORY_LIMIT"
+    )
+
+    # Authentication & sessions
+    # JWT_SECRET must be set to a long random value in production (see .env.example).
+    jwt_secret: Optional[str] = Field(default=None, validation_alias="JWT_SECRET")
+    session_ttl_hours: int = Field(default=24 * 7, validation_alias="SESSION_TTL_HOURS")
+    session_cookie_name: str = Field(default="lumora_session", validation_alias="SESSION_COOKIE_NAME")
+    # Secure cookies require HTTPS; defaults to on in production
+    cookie_secure: Optional[bool] = Field(default=None, validation_alias="COOKIE_SECURE")
+    allow_registration: bool = Field(default=True, validation_alias="ALLOW_REGISTRATION")
+
+    # Transactional email (verification and password-reset codes).
+    # Brevo's HTTPS API works on hosts that block SMTP ports (e.g. Render's free tier); SMTP
+    # (e.g. Gmail with an app password) works for local development and paid hosts.
+    brevo_api_key: Optional[str] = Field(default=None, validation_alias="BREVO_API_KEY")
+    smtp_host: Optional[str] = Field(default=None, validation_alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
+    smtp_username: Optional[str] = Field(default=None, validation_alias="SMTP_USERNAME")
+    smtp_password: Optional[str] = Field(default=None, validation_alias="SMTP_PASSWORD")
+    email_from_address: Optional[str] = Field(default=None, validation_alias="EMAIL_FROM_ADDRESS")
+    email_from_name: str = Field(default="LumoraAI", validation_alias="EMAIL_FROM_NAME")
+    # auto = required whenever an email provider is configured; true/false force it
+    email_verification: str = Field(default="auto", validation_alias="EMAIL_VERIFICATION")
+    email_code_ttl_minutes: int = Field(default=10, validation_alias="EMAIL_CODE_TTL_MINUTES")
+    # Daily study reminder emails: a scheduler (the GitHub Actions workflow) calls
+    # POST /api/v1/reminders/run with this secret every hour; each learner gets one email a day,
+    # from REMINDER_HOUR in their own time zone.
+    cron_secret: Optional[str] = Field(default=None, validation_alias="CRON_SECRET")
+    reminder_hour: int = Field(default=7, ge=0, le=20, validation_alias="REMINDER_HOUR")
+    # Adds the Operating Systems, DBMS and Computer Networks workspaces to every account once
+    starter_workspaces: bool = Field(default=True, validation_alias="STARTER_WORKSPACES")
+    # Public URL of the web app, used for links inside emails
+    app_base_url: Optional[str] = Field(default=None, validation_alias="APP_BASE_URL")
+
+    @property
+    def email_provider(self) -> Optional[str]:
+        if self.brevo_api_key and self.email_from_address:
+            return "brevo"
+        if self.smtp_host and self.email_from_address:
+            return "smtp"
+        return None
+
+    @property
+    def email_enabled(self) -> bool:
+        return self.email_provider is not None
+
+    @property
+    def email_verification_required(self) -> bool:
+        mode = (self.email_verification or "auto").strip().lower()
+        if mode in {"false", "off", "0", "no"}:
+            return False
+        if mode in {"true", "on", "1", "yes"}:
+            return self.email_enabled
+        return self.email_enabled
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() == "production"
+
+    @property
+    def effective_cookie_secure(self) -> bool:
+        return self.cookie_secure if self.cookie_secure is not None else self.is_production
+
+    # Chunking Configuration
+    chunk_size_chars: int = 1000
+    chunk_overlap_chars: int = 150
+    max_file_size_bytes: int = 10 * 1024 * 1024  # 10 MB
+
+    model_config = SettingsConfigDict(
+        env_file=([str(_ROOT_ENV), str(_BACKEND_ENV)] if (_ROOT_ENV.exists() or _BACKEND_ENV.exists()) else None),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    @field_validator("gemini_model")
+    @classmethod
+    def validate_gemini_model(cls, v: str) -> str:
+        if not v or not isinstance(v, str):
+            raise ValueError("GEMINI_MODEL must be a non-empty string.")
+        trimmed = v.strip()
+        lower = trimmed.lower()
+        if any(legacy in lower for legacy in ["3.6", "2.5", "1.5", "1.0", "pro-vision"]):
+            raise ValueError(
+                f"Obsolete or prohibited Gemini generation model configured: '{trimmed}'. "
+                f"LumoraAI requires Gemini 3.8 Flash ('models/gemini-3.8-flash' or 'gemini-3.8-flash'). "
+                f"Please update GEMINI_MODEL in your .env configuration."
+            )
+        normalized = trimmed.replace("models/", "")
+        if normalized != "gemini-3.8-flash":
+            raise ValueError(
+                f"Unsupported Gemini generation model configured: '{trimmed}'. "
+                f"LumoraAI strictly expects 'models/gemini-3.8-flash' or 'gemini-3.8-flash'. "
+                f"Please check GEMINI_MODEL in your environment."
+            )
+        return trimmed
+
+    @field_validator("gemini_generation_model")
+    @classmethod
+    def validate_generation_model(cls, v: str) -> str:
+        normalized = (v or "").strip().replace("models/", "")
+        if normalized not in GENERATION_MODELS:
+            raise ValueError(
+                f"Unsupported GEMINI_GENERATION_MODEL '{v}'. Choose one of: {', '.join(sorted(GENERATION_MODELS))}."
+            )
+        return normalized
+
+    @field_validator("gemini_embedding_model")
+    @classmethod
+    def validate_embedding_model(cls, v: str) -> str:
+        if v != "models/gemini-embedding-001":
+            raise ValueError(
+                f"Invalid GEMINI_EMBEDDING_MODEL '{v}'. LumoraAI requires 'models/gemini-embedding-001'."
+            )
+        return v
+
+    @field_validator("embedding_dimensions")
+    @classmethod
+    def validate_embedding_dimensions(cls, v: int) -> int:
+        if v != 768:
+            raise ValueError(
+                f"Invalid EMBEDDING_DIMENSIONS '{v}'. LumoraAI requires 768 dimensions."
+            )
+        return v
+
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v, info):
+        origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+        # Honour FRONTEND_ORIGIN so a deployed frontend can call the API directly
+        frontend_origin = (info.data or {}).get("frontend_origin")
+        if frontend_origin:
+            origins.append(frontend_origin.rstrip("/"))
+        if isinstance(v, list):
+            origins.extend(v)
+        return sorted(set(origins))
+
+
+settings = Settings()

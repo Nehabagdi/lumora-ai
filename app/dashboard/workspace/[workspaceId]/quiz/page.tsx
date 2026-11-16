@@ -1,0 +1,931 @@
+'use client'
+
+import { useState, useEffect, useRef } from 'react'
+import { useParams, useRouter } from 'next/navigation'
+import Link from 'next/link'
+import {
+  Zap,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  ArrowRight,
+  RotateCcw,
+  Sparkles,
+  Layers,
+  BookOpen,
+  MessagesSquare,
+  AlertTriangle,
+  FileText,
+  ChevronRight,
+  TrendingUp,
+  Loader2,
+  Award,
+  Target,
+  Brain,
+} from 'lucide-react'
+import { workspaceService } from '@/lib/services/workspace-service'
+import { tutorApiClient } from '@/lib/api/tutor-api-client'
+import { Workspace } from '@/lib/types/domain'
+import { Badge } from '@/components/ui/badge'
+import { Progress } from '@/components/ui/progress'
+import { cn } from '@/lib/utils'
+
+interface PublicQuestionOption {
+  key?: string
+  option_id?: string
+  text: string
+}
+
+interface SourceCitation {
+  document_id?: string
+  document_name: string
+  page_or_slide: number
+  excerpt?: string
+}
+
+interface PublicQuizQuestion {
+  id: string
+  session_id?: string
+  quiz_session_id?: string
+  workspace_id: string
+  question_text: string
+  options: PublicQuestionOption[]
+  difficulty?: number
+  difficulty_level?: number
+  concept?: string
+  concept_tag?: string
+  topic?: string
+  topic_id?: string
+  question_order?: number
+  question_index?: number
+  document_name?: string
+  page_number?: number
+  source_citations?: SourceCitation[]
+  explanation_hint?: string
+}
+
+interface AttemptResult {
+  is_correct: boolean
+  correct_option: string
+  explanation: string
+  earned_score?: number
+  previous_difficulty?: number
+  new_difficulty?: number
+  adaptation_reason?: string
+  document_name?: string
+  page_number?: number
+  source_excerpt?: string
+  source_citations?: SourceCitation[]
+  is_quiz_completed: boolean
+  adaptation_round?: number
+  adaptation_metadata?: Record<string, any>
+  next_question?: PublicQuizQuestion | null
+}
+
+interface ConceptPerformance {
+  concept_name: string
+  topic_name?: string
+  attempts: number
+  correct: number
+  accuracy_percentage: number
+  p_mastery?: number
+  mastery_percentage?: number
+  gap_priority?: number
+  status: string
+  recommended_action?: string
+  mastery_status?: 'mastered' | 'proficient' | 'review_needed'
+}
+
+interface KnowledgeGapDetail {
+  concept: string
+  topic: string
+  gap_priority: number
+  status: string
+  p_mastery: number
+  recommended_action: string
+}
+
+interface QuizSummary {
+  session_id: string
+  workspace_id: string
+  total_questions: number
+  correct_answers?: number
+  correct_count?: number
+  score: number
+  accuracy_percentage: number
+  average_response_time_seconds: number
+  final_difficulty_level?: number
+  adaptation_round?: number
+  concept_breakdown?: ConceptPerformance[]
+  concept_performance?: ConceptPerformance[]
+  knowledge_gaps?: any[]
+  knowledge_gaps_identified?: string[]
+  strengths?: string[]
+  recommendations?: string[]
+  recommendation?: string
+}
+
+const DIFFICULTY_LABELS: Record<number, { name: string; variant: 'neutral' | 'success' | 'warning' | 'destructive' }> = {
+  1: { name: 'Level 1: Foundational', variant: 'neutral' },
+  2: { name: 'Level 2: Intermediate', variant: 'warning' },
+  3: { name: 'Level 3: Advanced', variant: 'warning' },
+  4: { name: 'Level 4: Mastery', variant: 'success' },
+  5: { name: 'Level 5: Expert', variant: 'destructive' },
+}
+
+export default function AdaptiveQuizPage() {
+  const params = useParams()
+  const router = useRouter()
+  const workspaceId = params?.workspaceId as string
+
+  const [workspace, setWorkspace] = useState<Workspace | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [currentQuestion, setCurrentQuestion] = useState<PublicQuizQuestion | null>(null)
+  const [questionOrder, setQuestionOrder] = useState<number>(1)
+  const [totalTargetQuestions, setTotalTargetQuestions] = useState<number>(5)
+  const [currentDifficulty, setCurrentDifficulty] = useState<number>(2)
+
+  // Multi-batch adaptive learning state
+  const [adaptationRound, setAdaptationRound] = useState<number>(1)
+  const [adaptationStage, setAdaptationStage] = useState<string>('initial_diagnostic')
+  const [targetConcepts, setTargetConcepts] = useState<string[]>([])
+  const [isGeneratingNextBatch, setIsGeneratingNextBatch] = useState<boolean>(false)
+  const [batchError, setBatchError] = useState<string | null>(null)
+
+  const [selectedOption, setSelectedOption] = useState<string | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false)
+  const [isAnswerSubmitted, setIsAnswerSubmitted] = useState<boolean>(false)
+  const [attemptResult, setAttemptResult] = useState<AttemptResult | null>(null)
+  const [quizSummary, setQuizSummary] = useState<QuizSummary | null>(null)
+
+  const [isLoading, setIsLoading] = useState<boolean>(true)
+  const [errorCode, setErrorCode] = useState<string | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [timerSeconds, setTimerSeconds] = useState<number>(0)
+
+  const questionStartTimeRef = useRef<number>(performance.now())
+
+  // Initialize workspace & quiz session
+  const startQuizSession = async (forceNew: boolean = false) => {
+    if (!workspaceId) return
+    setIsLoading(true)
+    setErrorCode(null)
+    setErrorMessage(null)
+    setQuizSummary(null)
+    setAttemptResult(null)
+    setIsAnswerSubmitted(false)
+    setSelectedOption(null)
+    setTimerSeconds(0)
+    setAdaptationRound(1)
+    setAdaptationStage('initial_diagnostic')
+    setTargetConcepts([])
+
+    try {
+      const ws = await workspaceService.getWorkspaceById(workspaceId)
+      setWorkspace(ws)
+
+      let sessionData = null
+      if (!forceNew) {
+        sessionData = await tutorApiClient.getActiveQuizSession(workspaceId)
+      }
+
+      if (!sessionData) {
+        sessionData = await tutorApiClient.createQuizSession(workspaceId, {
+          targetQuestionCount: 5,
+          initialDifficulty: 2,
+        })
+      }
+
+      setSessionId(sessionData.id)
+      setCurrentDifficulty(sessionData.current_difficulty || 2)
+      setTotalTargetQuestions(sessionData.target_question_count || 5)
+      setAdaptationRound(sessionData.adaptation_round || 1)
+      setAdaptationStage(sessionData.current_adaptation_stage || 'initial_diagnostic')
+
+      if (sessionData.current_question) {
+        setCurrentQuestion(sessionData.current_question)
+        setQuestionOrder(sessionData.current_question_index || sessionData.current_question.question_index || 1)
+        questionStartTimeRef.current = performance.now()
+      } else if (sessionData.status === 'completed') {
+        const summary = await tutorApiClient.completeQuizSession(workspaceId, sessionData.id)
+        setQuizSummary(summary)
+      } else {
+        setErrorMessage('No questions could be generated. Please ensure your workspace has indexed documents.')
+      }
+    } catch (err: any) {
+      console.error('Failed to initialize quiz session:', err)
+      const isNoDocs =
+        err.code === 'NO_INDEXED_DOCUMENTS' ||
+        (typeof err.message === 'string' && err.message.toLowerCase().includes('no indexed'))
+      const isBackendDown =
+        err.code === 'BACKEND_UNAVAILABLE' ||
+        (typeof err.message === 'string' && err.message.includes('BACKEND_UNAVAILABLE'))
+
+      if (isNoDocs) {
+        setErrorCode('NO_INDEXED_DOCUMENTS')
+        setErrorMessage('Upload learning material to generate a grounded adaptive quiz.')
+      } else if (err.code === 'QUIZ_PREPARING') {
+        setErrorCode('QUIZ_PREPARING')
+        setErrorMessage(err.message || 'Your quiz questions are still being written and checked from your notes.')
+      } else if (isBackendDown) {
+        setErrorCode('BACKEND_UNAVAILABLE')
+        setErrorMessage(
+          'The backend service is currently unreachable via the API proxy. Please verify the backend is running.'
+        )
+      } else {
+        setErrorMessage(err.message || 'Unable to create adaptive quiz session. Please verify workspace sources are indexed.')
+      }
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+
+  useEffect(() => {
+    startQuizSession()
+  }, [workspaceId])
+
+  // Questions are written and reviewed in the background after an upload; retry automatically
+  const preparingRetriesRef = useRef(0)
+  useEffect(() => {
+    if (errorCode !== 'QUIZ_PREPARING') {
+      if (errorCode === null && currentQuestion) preparingRetriesRef.current = 0
+      return
+    }
+    if (preparingRetriesRef.current >= 6) return
+    const timer = setTimeout(() => {
+      preparingRetriesRef.current += 1
+      startQuizSession(true)
+    }, 20000)
+    return () => clearTimeout(timer)
+  }, [errorCode, currentQuestion])
+
+  // Timer per question
+  useEffect(() => {
+    let interval: NodeJS.Timeout
+    if (!quizSummary && !isAnswerSubmitted && !isLoading && !errorCode) {
+      interval = setInterval(() => {
+        setTimerSeconds((prev) => prev + 1)
+      }, 1000)
+    }
+    return () => clearInterval(interval)
+  }, [quizSummary, isAnswerSubmitted, isLoading, errorCode])
+
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  }
+
+  // Handle Answer Submission with High-Precision Timing
+  const handleSubmitAnswer = async () => {
+    if (!sessionId || !currentQuestion || !selectedOption || isSubmitting) return
+
+    const responseTimeMs = Math.max(500, Math.round(performance.now() - questionStartTimeRef.current))
+    setIsSubmitting(true)
+
+    try {
+      const result: AttemptResult = await tutorApiClient.submitQuizAttempt(
+        workspaceId,
+        sessionId,
+        currentQuestion.id,
+        {
+          selectedOption,
+          responseTimeMs,
+        }
+      )
+
+      setAttemptResult(result)
+      setIsAnswerSubmitted(true)
+      setCurrentDifficulty(result.new_difficulty ?? currentDifficulty)
+      if (result.adaptation_round) {
+        setAdaptationRound(result.adaptation_round)
+      }
+    } catch (err: any) {
+      console.error('Failed to submit quiz attempt:', err)
+      alert(err.message || 'Failed to submit answer. Please try again.')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  // Advance to Next Question or Complete Current Batch
+  const handleNextQuestion = async () => {
+    if (!sessionId || !attemptResult) return
+
+    if (attemptResult.is_quiz_completed || !attemptResult.next_question) {
+      // Complete Session / Batch
+      setIsLoading(true)
+      try {
+        const summary: QuizSummary = await tutorApiClient.completeQuizSession(workspaceId, sessionId)
+        setQuizSummary(summary)
+        if (summary.adaptation_round) {
+          setAdaptationRound(summary.adaptation_round)
+        }
+      } catch (err: any) {
+        console.error('Failed to complete quiz session:', err)
+        alert(err.message || 'Failed to generate quiz summary.')
+      } finally {
+        setIsLoading(false)
+      }
+    } else {
+      // Next Question in Current Batch
+      setCurrentQuestion(attemptResult.next_question)
+      setQuestionOrder(attemptResult.next_question.question_order || (questionOrder + 1))
+      setCurrentDifficulty(attemptResult.next_question.difficulty_level || currentDifficulty)
+      setSelectedOption(null)
+      setIsAnswerSubmitted(false)
+      setAttemptResult(null)
+      setTimerSeconds(0)
+      questionStartTimeRef.current = performance.now()
+    }
+  }
+
+  // Start Next Adaptive Batch (e.g. Round 2: Targeted Reinforcement)
+  const handleStartNextBatch = async () => {
+    if (!sessionId || !workspaceId || isGeneratingNextBatch) return
+    setIsGeneratingNextBatch(true)
+    setBatchError(null)
+
+    try {
+      const nextBatch = await tutorApiClient.startNextQuizBatch(workspaceId, sessionId, { batchSize: 5 })
+
+      if (!nextBatch || !nextBatch.first_question) {
+        setBatchError('Unable to generate additional adaptive questions from workspace sources at this time.')
+        return
+      }
+
+      setAdaptationRound(nextBatch.adaptation_round || (adaptationRound + 1))
+      setAdaptationStage(nextBatch.current_adaptation_stage || 'targeted_reinforcement')
+      setTargetConcepts(nextBatch.target_concepts || [])
+      setTotalTargetQuestions((prev) => prev + (nextBatch.new_questions_count || 5))
+      setQuizSummary(null)
+      setAttemptResult(null)
+      setIsAnswerSubmitted(false)
+      setSelectedOption(null)
+      setTimerSeconds(0)
+
+      setCurrentQuestion(nextBatch.first_question)
+      setQuestionOrder(nextBatch.first_question.question_order || (questionOrder + 1))
+      setCurrentDifficulty(nextBatch.first_question.difficulty_level || currentDifficulty)
+      questionStartTimeRef.current = performance.now()
+    } catch (err: any) {
+      console.error('Failed to start next adaptive batch:', err)
+      setBatchError(err.message || 'Failed to start next adaptive batch. Please verify sources are indexed.')
+    } finally {
+      setIsGeneratingNextBatch(false)
+    }
+  }
+
+  // ============================================================
+  // EMPTY STATE: NO INDEXED DOCUMENTS (e.g. OS workspace)
+  // ============================================================
+  if (errorCode === 'NO_INDEXED_DOCUMENTS') {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-4 py-16 text-center animate-in fade-in duration-200">
+        <div className="rounded-3xl border border-dashed border-border bg-card/50 p-10 shadow-soft">
+          <div className="mx-auto flex size-14 items-center justify-center rounded-2xl bg-muted/60 text-muted-foreground">
+            <BookOpen className="size-7" />
+          </div>
+          <h2 className="mt-4 font-display text-lg font-semibold text-foreground">
+            No indexed learning materials
+          </h2>
+          <p className="mt-2 text-xs text-muted-foreground leading-relaxed max-w-md mx-auto">
+            Upload learning material to generate a grounded adaptive quiz.
+          </p>
+          <div className="mt-6 flex justify-center gap-3">
+            <Link
+              href={`/dashboard/workspace/${workspaceId}/sources`}
+              className="inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-xs font-semibold text-primary-foreground shadow-glow hover:opacity-90 transition-opacity"
+            >
+              <span>Add Source</span>
+              <ArrowRight className="size-3.5" />
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // PREPARING STATE: questions are still being written from the notes
+  // ============================================================
+  if (errorCode === 'QUIZ_PREPARING' && !isLoading) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-4 py-16 text-center animate-in fade-in duration-200">
+        <div className="rounded-3xl border border-border bg-card/60 p-10 shadow-soft">
+          <Loader2 className="mx-auto size-10 animate-spin text-primary" />
+          <h2 className="mt-4 font-display text-lg font-semibold text-foreground">
+            Preparing your quiz
+          </h2>
+          <p className="mt-2 text-xs text-muted-foreground leading-relaxed max-w-md mx-auto">
+            {errorMessage} Each question is checked for a correct answer key before you see it. This page
+            retries on its own.
+          </p>
+          <div className="mt-6 flex justify-center gap-3">
+            <button
+              onClick={() => startQuizSession(true)}
+              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2.5 text-xs font-medium text-foreground hover:bg-accent/40"
+            >
+              <RotateCcw className="size-3.5" />
+              <span>Try now</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // LOADING STATE
+  // ============================================================
+  if (isLoading && !quizSummary) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-4 py-24 text-center">
+        <div className="flex flex-col items-center justify-center gap-4 rounded-3xl border border-border bg-card/60 p-12 shadow-soft">
+          <Loader2 className="size-10 animate-spin text-primary" />
+          <h2 className="font-display text-lg font-semibold text-foreground">
+            Synthesizing Adaptive Diagnostics...
+          </h2>
+          <p className="max-w-md text-xs text-muted-foreground leading-relaxed">
+            Retrieving grounded excerpts from your workspace documents to construct personalized diagnostic questions.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // GENERIC ERROR STATE
+  // ============================================================
+  if (errorMessage || !currentQuestion) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-4 py-16 text-center">
+        <div className="rounded-3xl border border-dashed border-border bg-card/50 p-10">
+          <Zap className="mx-auto size-10 text-muted-foreground/60" />
+          <h2 className="mt-4 font-display text-lg font-semibold text-foreground">
+            No Quiz Questions Available
+          </h2>
+          <p className="mt-2 text-xs text-muted-foreground leading-relaxed max-w-md mx-auto">
+            {errorMessage || `Upload lecture slides, textbooks, or notes in the Sources tab to automatically generate adaptive diagnostic quizzes for ${workspace?.name || 'this workspace'}.`}
+          </p>
+          <div className="mt-6 flex justify-center gap-3">
+            <Link
+              href={`/dashboard/workspace/${workspaceId}/sources`}
+              className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-xs font-semibold text-primary-foreground shadow-glow"
+            >
+              <span>Manage Learning Sources</span>
+              <ArrowRight className="size-3.5" />
+            </Link>
+            <button
+              onClick={() => startQuizSession(true)}
+              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2.5 text-xs font-medium text-foreground hover:bg-accent/40"
+            >
+              <RotateCcw className="size-3.5" />
+              <span>Retry</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // QUIZ SUMMARY / INTERIM ADAPTIVE ANALYSIS SCREEN
+  // ============================================================
+  if (quizSummary) {
+    const rawGaps = quizSummary.knowledge_gaps || []
+    const weakConceptNames = (quizSummary.knowledge_gaps_identified && quizSummary.knowledge_gaps_identified.length > 0)
+      ? quizSummary.knowledge_gaps_identified
+      : rawGaps.map((g: any) => (typeof g === 'string' ? g : g.concept))
+
+    const tutorPrompt = weakConceptNames.length > 0
+      ? `I completed Round ${adaptationRound} adaptive assessment and need help understanding: ${weakConceptNames.join(', ')}. Can you explain the core principles with grounded examples?`
+      : 'Can you give me an advanced conceptual challenge based on our workspace sources?'
+
+    const conceptList = quizSummary.concept_performance || quizSummary.concept_breakdown || []
+
+    return (
+      <div className="mx-auto w-full max-w-3xl px-4 py-8 md:py-12">
+        <div className="rounded-3xl border border-border bg-card p-6 shadow-card md:p-10 text-center animate-in fade-in zoom-in-95 duration-200">
+          <div className="flex items-center justify-center gap-2">
+            <span className="flex size-14 items-center justify-center rounded-2xl bg-primary/10 text-primary shadow-glow">
+              <Award className="size-7" />
+            </span>
+          </div>
+
+          <div className="mt-4 flex items-center justify-center gap-2">
+            <Badge variant="neutral" size="sm" className="bg-primary/10 text-primary border-primary/20 text-[11px] font-semibold">
+              Round {adaptationRound}: {adaptationRound === 1 ? 'Diagnostic Assessment' : 'Targeted Reinforcement'}
+            </Badge>
+          </div>
+
+          <h1 className="mt-2 font-display text-2xl font-semibold text-foreground md:text-3xl">
+            {adaptationRound === 1 ? 'Diagnostic Assessment Analyzed' : `Round ${adaptationRound} Assessment Completed`}
+          </h1>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {workspace?.name || 'Workspace'} — Bayesian Knowledge Tracing & Gap Priority Matrix
+          </p>
+
+          {/* Key Metrics */}
+          <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="rounded-2xl border border-border bg-background p-4">
+              <span className="text-[11px] text-muted-foreground">Score</span>
+              <p className="mt-1 font-display text-2xl font-bold text-foreground">
+                {quizSummary.score}
+              </p>
+              <span className="text-[10px] text-muted-foreground">
+                {quizSummary.correct_count ?? quizSummary.correct_answers ?? 0} of {quizSummary.total_questions} correct
+              </span>
+            </div>
+            <div className="rounded-2xl border border-border bg-background p-4">
+              <span className="text-[11px] text-muted-foreground">Accuracy</span>
+              <p className="mt-1 font-display text-2xl font-bold text-primary">
+                {quizSummary.accuracy_percentage}%
+              </p>
+              <span className="text-[10px] text-muted-foreground">Precision Rate</span>
+            </div>
+            <div className="rounded-2xl border border-border bg-background p-4">
+              <span className="text-[11px] text-muted-foreground">Avg Response Time</span>
+              <p className="mt-1 font-display text-2xl font-bold text-foreground">
+                {quizSummary.average_response_time_seconds}s
+              </p>
+              <span className="text-[10px] text-muted-foreground">Speed Calibration</span>
+            </div>
+            <div className="rounded-2xl border border-border bg-background p-4">
+              <span className="text-[11px] text-muted-foreground">BKT Mastery Status</span>
+              <p className="mt-1 font-display text-xl font-bold text-warning">
+                {weakConceptNames.length === 0 ? 'High' : 'Calibrated'}
+              </p>
+              <span className="text-[10px] text-muted-foreground">
+                {weakConceptNames.length} gap{weakConceptNames.length === 1 ? '' : 's'} flagged
+              </span>
+            </div>
+          </div>
+
+          {/* Bayesian Concept Mastery Matrix */}
+          {conceptList.length > 0 && (
+            <div className="mt-6 text-left">
+              <div className="flex items-center justify-between">
+                <h3 className="font-display text-sm font-semibold text-foreground flex items-center gap-1.5">
+                  <Brain className="size-4 text-primary" />
+                  <span>BKT Concept Mastery Matrix</span>
+                </h3>
+                <span className="text-[10px] text-muted-foreground">Multi-Signal Posterior Probability</span>
+              </div>
+
+              <div className="mt-3 flex flex-col gap-2.5">
+                {conceptList.map((c: any, i: number) => {
+                  const cName = c.concept_name || c.concept
+                  const cAcc = c.accuracy_percentage
+                  const pMastery = typeof c.p_mastery === 'number' ? c.p_mastery : 0.3
+                  const masteryPct = typeof c.mastery_percentage === 'number' ? c.mastery_percentage : Math.round(pMastery * 100)
+                  const cStatus = c.status || c.mastery_status || (masteryPct >= 75 ? 'strong' : masteryPct >= 50 ? 'developing' : 'needs_attention')
+
+                  const isStrong = cStatus === 'strong' || cStatus === 'mastered'
+                  const isDeveloping = cStatus === 'developing' || cStatus === 'proficient'
+
+                  return (
+                    <div
+                      key={i}
+                      className="rounded-2xl border border-border bg-background p-3.5 text-xs transition-all hover:border-border/80"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="font-semibold text-foreground">{cName}</span>
+                          <span className="ml-2 text-[10px] text-muted-foreground">
+                            {c.correct}/{c.attempts || c.total_questions || 1} correct ({cAcc}%)
+                          </span>
+                        </div>
+                        <Badge
+                          variant={isStrong ? 'success' : isDeveloping ? 'warning' : 'destructive'}
+                          size="sm"
+                          className="capitalize text-[10px]"
+                        >
+                          {isStrong ? 'Mastered' : isDeveloping ? 'Proficient' : 'Needs Attention'}
+                        </Badge>
+                      </div>
+
+                      {/* BKT Mastery Bar */}
+                      <div className="mt-2.5 flex items-center gap-2.5">
+                        <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className={cn(
+                              'h-full rounded-full transition-all duration-500',
+                              isStrong ? 'bg-success' : isDeveloping ? 'bg-warning' : 'bg-destructive'
+                            )}
+                            style={{ width: `${Math.max(5, Math.min(100, masteryPct))}%` }}
+                          />
+                        </div>
+                        <span className="text-[10px] font-mono font-medium text-muted-foreground min-w-[50px] text-right">
+                          {masteryPct}% BKT
+                        </span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Identified Gaps */}
+          {weakConceptNames.length > 0 && (
+            <div className="mt-6 rounded-2xl border border-destructive/20 bg-destructive/5 p-4 text-left">
+              <div className="flex items-center gap-2 text-xs font-semibold text-destructive">
+                <AlertTriangle className="size-4" />
+                <span>Identified Knowledge Gaps (Prioritized for Reinforcement)</span>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                The adaptive engine detected conceptual fragility on:{' '}
+                <strong className="text-foreground">{weakConceptNames.join(', ')}</strong>.
+                Targeted questions have been calibrated for your next adaptive batch.
+              </p>
+            </div>
+          )}
+
+          {/* AI Recommendations */}
+          {(quizSummary.recommendation || quizSummary.recommendations) && (
+            <div className="mt-4 rounded-2xl border border-primary/20 bg-primary/5 p-4 text-left text-xs">
+              <div className="flex items-center gap-2 font-semibold text-primary">
+                <Sparkles className="size-4" />
+                <span>AI Tutor Insights</span>
+              </div>
+              <p className="mt-2 text-muted-foreground leading-relaxed">
+                {quizSummary.recommendation ||
+                  (Array.isArray(quizSummary.recommendations)
+                    ? quizSummary.recommendations.join(' ')
+                    : 'Review identified topics with AI Tutor.')}
+              </p>
+            </div>
+          )}
+
+          {/* Batch Synthesis Error Alert */}
+          {batchError && (
+            <div className="mt-6 rounded-2xl border border-warning/40 bg-warning/10 p-4 text-xs text-warning text-left">
+              <span className="font-semibold">Batch Notice:</span> {batchError}
+            </div>
+          )}
+
+          {/* Adaptive Learning Actions */}
+          <div className="mt-6 flex flex-col sm:flex-row gap-3">
+            {/* Primary Action: Launch Next Targeted Batch */}
+            <button
+              onClick={handleStartNextBatch}
+              disabled={isGeneratingNextBatch}
+              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-primary py-3 px-4 text-xs font-semibold text-primary-foreground shadow-glow transition-all hover:opacity-90 disabled:opacity-50"
+            >
+              {isGeneratingNextBatch ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  <span>Synthesizing Round {adaptationRound + 1}...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="size-4" />
+                  <span>Start Targeted Adaptive Batch (Round {adaptationRound + 1})</span>
+                </>
+              )}
+            </button>
+
+            <Link
+              href={`/dashboard/workspace/${workspaceId}/tutor?prompt=${encodeURIComponent(tutorPrompt)}`}
+              className="flex items-center justify-center gap-2 rounded-xl border border-primary/30 bg-primary/5 py-3 px-4 text-xs font-semibold text-primary transition-colors hover:bg-primary/10"
+            >
+              <MessagesSquare className="size-4" />
+              <span>Review Weak Areas with Tutor</span>
+            </Link>
+
+            <Link
+              href={`/dashboard/workspace/${workspaceId}`}
+              className="flex items-center justify-center gap-2 rounded-xl border border-border bg-card py-3 px-4 text-xs font-semibold text-foreground transition-colors hover:bg-accent/40"
+            >
+              <span>Back to Overview</span>
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // ACTIVE QUESTION SCREEN
+  // ============================================================
+  const currentConcept = currentQuestion.concept || currentQuestion.concept_tag || 'Core Principle'
+  const currentDiff = currentQuestion.difficulty || currentQuestion.difficulty_level || currentDifficulty
+  const diffMeta = DIFFICULTY_LABELS[currentDiff] || {
+    name: `Level ${currentDiff}`,
+    variant: 'neutral',
+  }
+
+  const citations = attemptResult?.document_name
+    ? [{
+        document_name: attemptResult.document_name,
+        page_or_slide: attemptResult.page_number || 1,
+        excerpt: attemptResult.source_excerpt,
+      }]
+    : (attemptResult?.source_citations || [])
+
+  return (
+    <div className="mx-auto w-full max-w-3xl px-4 py-6 md:py-8">
+      <div className="rounded-3xl border border-border bg-card p-6 shadow-soft md:p-8">
+        {/* Header Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
+          <div className="flex items-center gap-2.5">
+            <span className="flex size-9 items-center justify-center rounded-xl bg-warning/15 text-warning">
+              <Zap className="size-4" />
+            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="font-display text-sm font-semibold text-foreground">{workspace?.name || 'Workspace'}</h2>
+                <Badge variant="neutral" size="sm" className="text-[10px] bg-primary/10 text-primary border-primary/20">
+                  Round {adaptationRound}
+                </Badge>
+                <Badge variant="neutral" size="sm" className="text-[10px]">
+                  {currentConcept}
+                </Badge>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {adaptationRound === 1 ? 'Phase 2 Adaptive Diagnostic Engine' : `Targeted Reinforcement Round ${adaptationRound}`}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <Badge variant={diffMeta.variant} size="md" className="capitalize text-xs font-semibold">
+              {diffMeta.name}
+            </Badge>
+            <span className="flex items-center gap-1 text-xs font-medium tabular-nums text-muted-foreground">
+              <Clock className="size-3.5" /> {formatTime(timerSeconds)}
+            </span>
+          </div>
+        </div>
+
+        {/* Targeted Concepts Banner (if in targeted round) */}
+        {targetConcepts.length > 0 && (
+          <div className="mt-3 flex items-center gap-2 rounded-xl bg-accent/30 px-3 py-1.5 text-[11px] text-muted-foreground">
+            <Target className="size-3 text-primary shrink-0" />
+            <span>Targeting Knowledge Gaps: <strong className="text-foreground">{targetConcepts.join(', ')}</strong></span>
+          </div>
+        )}
+
+        {/* Question Counter & Progress */}
+        <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground">
+          <span>Question {questionOrder} of {totalTargetQuestions}</span>
+          <div className="flex gap-1">
+            {Array.from({ length: totalTargetQuestions }).map((_, i) => (
+              <span
+                key={i}
+                className={cn(
+                  'h-1.5 w-5 rounded-full transition-colors',
+                  i + 1 === questionOrder
+                    ? 'bg-primary'
+                    : i + 1 < questionOrder
+                    ? 'bg-primary/50'
+                    : 'bg-muted'
+                )}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Question Text */}
+        <div className="mt-6">
+          <p className="text-sm font-semibold leading-relaxed text-foreground md:text-base">
+            {currentQuestion.question_text}
+          </p>
+
+          {/* Options */}
+          <div className="mt-5 flex flex-col gap-2.5">
+            {currentQuestion.options.map((opt: any) => {
+              const optKey = opt.key || opt.option_id
+              const isSelected = selectedOption === optKey
+              const isCorrectOpt = isAnswerSubmitted && attemptResult && optKey === attemptResult.correct_option
+              const isWrongSelected = isAnswerSubmitted && isSelected && !attemptResult?.is_correct
+
+              return (
+                <button
+                  key={optKey}
+                  disabled={isAnswerSubmitted || isSubmitting}
+                  onClick={() => setSelectedOption(optKey)}
+                  className={cn(
+                    'flex items-center gap-3.5 rounded-2xl border p-4 text-left text-xs md:text-sm transition-all',
+                    !isAnswerSubmitted && !isSelected && 'border-border bg-background/50 hover:border-primary/40 hover:bg-accent/40',
+                    !isAnswerSubmitted && isSelected && 'border-primary bg-primary/10 font-semibold ring-1 ring-primary/40',
+                    isCorrectOpt && 'border-success/60 bg-success/10 text-foreground font-semibold',
+                    isWrongSelected && 'border-destructive/60 bg-destructive/10 text-foreground',
+                    isAnswerSubmitted && !isCorrectOpt && !isWrongSelected && 'border-border/60 opacity-60'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'flex size-7 shrink-0 items-center justify-center rounded-lg border text-xs font-bold transition-colors',
+                      isCorrectOpt
+                        ? 'border-success bg-success text-success-foreground'
+                        : isWrongSelected
+                        ? 'border-destructive bg-destructive text-destructive-foreground'
+                        : isSelected
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-border bg-card text-muted-foreground'
+                    )}
+                  >
+                    {isCorrectOpt ? <CheckCircle2 className="size-4" /> : isWrongSelected ? <XCircle className="size-4" /> : optKey}
+                  </span>
+                  <span className="flex-1 text-foreground">{opt.text}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* Feedback & Explanation Box (After Submission) */}
+        {isAnswerSubmitted && attemptResult && (
+          <div
+            className={cn(
+              'mt-6 rounded-2xl border p-4 text-xs leading-relaxed animate-in fade-in duration-150',
+              attemptResult.is_correct
+                ? 'border-success/30 bg-success/5 text-foreground'
+                : 'border-destructive/30 bg-destructive/5 text-foreground'
+            )}
+          >
+            <div className="flex items-center justify-between gap-2 font-semibold mb-1.5">
+              <div className="flex items-center gap-2">
+                {attemptResult.is_correct ? (
+                  <>
+                    <CheckCircle2 className="size-4 text-success" />
+                    <span className="text-success">Correct (+{attemptResult.earned_score} pts)</span>
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="size-4 text-destructive" />
+                    <span className="text-destructive">Incorrect — BKT Mastery Calibrated</span>
+                  </>
+                )}
+              </div>
+
+              {attemptResult.adaptation_reason && (
+                <span className="text-[10px] text-muted-foreground font-normal bg-background/80 px-2 py-0.5 rounded-md border border-border/50">
+                  {attemptResult.adaptation_reason}
+                </span>
+              )}
+            </div>
+
+            <p className="text-muted-foreground mt-1">{attemptResult.explanation}</p>
+
+            {/* Document Grounding Citation */}
+            {citations.length > 0 && (
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground border-t border-border/60 pt-2.5">
+                <FileText className="size-3.5 text-primary shrink-0" />
+                <span>
+                  Grounded in:{' '}
+                  <strong className="text-foreground">{citations[0].document_name}</strong>
+                  {' '}(Page {citations[0].page_or_slide})
+                </span>
+                {citations[0].excerpt && (
+                  <p className="w-full text-[10px] text-muted-foreground/80 italic pl-5 line-clamp-2">
+                    &ldquo;{citations[0].excerpt}&rdquo;
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Action Controls */}
+        <div className="mt-6 flex items-center justify-between border-t border-border pt-4">
+          <span className="text-xs text-muted-foreground">
+            Concept: <strong className="text-foreground">{currentConcept}</strong>
+          </span>
+
+          {!isAnswerSubmitted ? (
+            <button
+              onClick={handleSubmitAnswer}
+              disabled={!selectedOption || isSubmitting}
+              className="flex h-10 items-center justify-center gap-2 rounded-xl bg-primary px-6 text-xs font-semibold text-primary-foreground shadow-glow transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              {isSubmitting ? (
+                <>
+                  <Loader2 className="size-3.5 animate-spin" />
+                  <span>Evaluating...</span>
+                </>
+              ) : (
+                <span>Submit Answer</span>
+              )}
+            </button>
+          ) : (
+            <button
+              onClick={handleNextQuestion}
+              className="flex h-10 items-center justify-center gap-2 rounded-xl bg-primary px-6 text-xs font-semibold text-primary-foreground shadow-glow transition-opacity hover:opacity-90"
+            >
+              <span>
+                {attemptResult?.is_quiz_completed || questionOrder >= totalTargetQuestions
+                  ? 'Complete Round & View Analysis'
+                  : 'Next Question'}
+              </span>
+              <ArrowRight className="size-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

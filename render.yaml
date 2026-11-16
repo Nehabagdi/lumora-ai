@@ -1,0 +1,47 @@
+# Render Blueprint for the LumoraAI API (https://render.com/docs/blueprint-spec).
+# The Next.js app deploys to Vercel; point its BACKEND_API_URL at this service's URL.
+# Use a PostgreSQL database with pgvector (for example Supabase) for DATABASE_URL.
+services:
+  - type: web
+    name: lumora-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # Model that writes topic maps, quiz questions and flashcards
+      - key: GEMINI_GENERATION_MODEL
+        value: gemini-3.8-flash
+      - key: STUDY_MATERIAL_REVIEW
+        value: "true"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: workspace-documents
+      - key: FRONTEND_ORIGIN
+        sync: false
+      # Email for verification and password reset (Render's free tier blocks SMTP, so use Brevo).
+      # Leave BREVO_API_KEY empty to run without email features.
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: EMAIL_FROM_NAME
+        value: LumoraAI
+      # Daily study reminder emails: the same random value as the GitHub repository secret
+      # CRON_SECRET (the "Daily reminders" workflow calls the API hourly). Empty = reminders off.
+      - key: CRON_SECRET
+        sync: false
