@@ -113,7 +113,7 @@ lumora-ai/
 ## Quick start with Docker
 
 ```bash
-git clone https://github.com/MehveenFatima/lumora-ai.git
+git clone https://github.com/Nehabagdi/lumora-ai.git
 cd lumora-ai
 cp .env.example .env      # optional: add GEMINI_API_KEY / OPENROUTER_API_KEY
 docker compose up --build
